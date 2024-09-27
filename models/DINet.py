@@ -165,6 +165,64 @@ class SameBlock2d(nn.Module):
         out = self.relu(out)
         return out
 
+class SpatialTransformer(nn.Module):
+    '''
+
+    '''
+    def __init__(self, para_ch, feature_ch):
+        super(SpatialTransformer, self).__init__()
+        self.para_ch = para_ch
+        self.feature_ch = feature_ch
+
+        # Spatial transformer localization-network
+        self.localization = nn.Sequential(
+            nn.Conv2d(256, 8, kernel_size=7),  # Changed 1 to 256 to match input channels
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True),
+            nn.Conv2d(8, 10, kernel_size=5),
+            nn.MaxPool2d(2, stride=2),
+            nn.ReLU(True)
+        )
+
+        # Regressor for the 3 * 2 affine matrix
+        self.fc_loc = nn.Sequential(
+            nn.Linear(10 * 3, 32),
+            nn.ReLU(True),
+            nn.Linear(32, 3 * 2)
+        )
+
+        # Initialize the weights/bias with identity transformation
+        self.fc_loc[2].weight.data.zero_()
+        self.fc_loc[2].bias.data.copy_(torch.tensor([1, 0, 0, 0, 1, 0], dtype=torch.float))
+
+        # Layer to incorporate trans_para (image + audio parameters)
+        self.trans_para_fc = nn.Sequential(
+            nn.Linear(para_ch, 32),  # Using para_ch size from initialization
+            nn.ReLU(),
+            nn.Linear(32, 3 * 2)  # Output affine matrix parameters
+        )
+
+
+
+    def forward(self, feature_map, trans_para):
+        # Spatial transformation using trans_para
+        xs = self.localization(feature_map)
+
+        batch_size = xs.size(0)
+        xs = xs.view(batch_size, -1)
+
+        theta_loc = self.fc_loc(xs)
+
+        theta_para = self.trans_para_fc(trans_para)  # Affine transformation from trans_para
+        theta_combined = theta_loc + theta_para  # Combined affine matrix
+        theta_combined = theta_combined.view(-1, 2, 3)
+
+        # Apply affine transformation to feature_map
+        grid = F.affine_grid(theta_combined, feature_map.size())
+        transformed_feature_map = F.grid_sample(feature_map, grid)
+        return transformed_feature_map
+
+
 class AdaAT(nn.Module):
     '''
        AdaAT operator
@@ -263,6 +321,8 @@ class DINet(nn.Module):
             )
         self.appearance_conv_list = nn.ModuleList(appearance_conv_list)
         self.adaAT = AdaAT(256, 256)
+        self.spatial_transformer = SpatialTransformer(256,256)
+
         self.out_conv = nn.Sequential(
             SameBlock2d(512, 128, kernel_size=3, padding=1),
             UpBlock2d(128,128,kernel_size=3, padding=1),
@@ -288,7 +348,7 @@ class DINet(nn.Module):
         trans_para = torch.cat([img_para,audio_para],1)
         ## use AdaAT do spatial deformation on reference feature maps
         ref_trans_feature = self.appearance_conv_list[0](ref_in_feature)
-        ref_trans_feature = self.adaAT(ref_trans_feature, trans_para)
+        ref_trans_feature = self.spatial_transformer(ref_trans_feature,trans_para)
         ref_trans_feature = self.appearance_conv_list[1](ref_trans_feature)
         ## feature decoder
         merge_feature = torch.cat([source_in_feature,ref_trans_feature],1)
